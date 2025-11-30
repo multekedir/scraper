@@ -76,54 +76,264 @@ class GenericDealershipScraper(DealershipScraper):
     
     def get_listing_urls(self) -> List[str]:
         """
-        Get listing page URLs by trying common inventory page patterns.
+        Get listing page URLs by using new_inventory_url if available, or trying common patterns.
+        Also detects and includes pagination links to get all cars.
         
         Returns:
-            List of listing page URLs
+            List of listing page URLs (including paginated pages)
         """
-        urls = []
-        base = self.base_url.rstrip('/')
+        # Get the first/primary inventory page URL
+        primary_url = None
         
-        # Common inventory page patterns
-        patterns = [
-            f"{base}/inventory",
-            f"{base}/new-inventory",
-            f"{base}/inventory/new",
-            f"{base}/new-vehicles",
-            f"{base}/vehicles/new",
-            f"{base}/search/new",
-            f"{base}/inventory/index.htm",
-            f"{base}/new",
+        # If new_inventory_url is provided in CSV, use it directly
+        if self.dealership_info.new_inventory_url:
+            logger.info(f"{self.name}: Using provided inventory URL: {self.dealership_info.new_inventory_url}")
+            primary_url = self.dealership_info.new_inventory_url
+        else:
+            # Otherwise, try common inventory page patterns
+            base = self.base_url.rstrip('/')
+            
+            # Common inventory page patterns
+            patterns = [
+                f"{base}/inventory",
+                f"{base}/new-inventory",
+                f"{base}/inventory/new",
+                f"{base}/new-vehicles",
+                f"{base}/vehicles/new",
+                f"{base}/search/new",
+                f"{base}/inventory/index.htm",
+                f"{base}/new",
+            ]
+            
+            # Try to find the actual inventory page
+            for pattern in patterns:
+                try:
+                    html = self._get_page(pattern, check_robots=False)
+                    # Check if this looks like an inventory page
+                    if self._is_inventory_page(html):
+                        primary_url = pattern
+                        logger.debug(f"{self.name}: Found inventory page at {pattern}")
+                        break
+                except Exception as e:
+                    logger.debug(f"{self.name}: {pattern} not accessible: {e}")
+                    continue
+            
+            # If no inventory page found, try the base URL
+            if not primary_url:
+                try:
+                    html = self._get_page(base, check_robots=False)
+                    if self._is_inventory_page(html):
+                        primary_url = base
+                except:
+                    pass
+            
+            # If still nothing, use default
+            if not primary_url:
+                primary_url = f"{base}/inventory"
+                logger.warning(f"{self.name}: Using default inventory URL, may not work")
+        
+        # Start with the primary URL
+        all_urls = [primary_url]
+        
+        # Try to detect pagination and get all page URLs
+        try:
+            html = self._get_page(primary_url, check_robots=False)
+            pagination_urls = self._find_pagination_urls(html, primary_url)
+            if pagination_urls:
+                all_urls.extend(pagination_urls)
+                logger.info(f"{self.name}: Found {len(pagination_urls)} additional pagination pages")
+            
+            # Also try to follow "next" links recursively to find all pages
+            # This helps with sites that only show "next" button
+            next_urls = self._follow_next_links(primary_url, max_pages=50)
+            for next_url in next_urls:
+                if next_url not in all_urls:
+                    all_urls.append(next_url)
+                    logger.debug(f"{self.name}: Found additional page via next link: {next_url}")
+        except Exception as e:
+            logger.debug(f"{self.name}: Could not detect pagination: {e}")
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_urls = []
+        for url in all_urls:
+            if url not in seen:
+                seen.add(url)
+                unique_urls.append(url)
+        
+        logger.info(f"{self.name}: Found {len(unique_urls)} listing page(s) to scrape")
+        return unique_urls
+    
+    def _find_pagination_urls(self, html: BeautifulSoup, current_url: str) -> List[str]:
+        """
+        Find pagination links to get all pages of inventory.
+        
+        Args:
+            html: Parsed HTML of the current listing page
+            current_url: URL of the current page
+        
+        Returns:
+            List of additional pagination URLs
+        """
+        pagination_urls = []
+        
+        # Common pagination patterns
+        pagination_selectors = [
+            'a[aria-label*="next"]',
+            'a[aria-label*="Next"]',
+            'a[aria-label*="page"]',
+            'a[aria-label*="Page"]',
+            '.pagination a',
+            '.pager a',
+            '.page-nav a',
+            'a.pagination-link',
+            'a.page-link',
+            'a.next',
+            'a.Next',
+            'a[rel="next"]',
+            'a[class*="next"]',
+            'a[class*="page"]',
         ]
         
-        # Try to find the actual inventory page
-        for pattern in patterns:
+        # Find pagination links
+        pagination_links = []
+        for selector in pagination_selectors:
+            links = html.select(selector)
+            pagination_links.extend(links)
+        
+        # Also look for numbered page links (1, 2, 3, etc.)
+        all_links = html.find_all('a', href=True)
+        for link in all_links:
+            href = link.get('href', '')
+            text = link.get_text(strip=True)
+            
+            # Check if it's a page number link
+            if text.isdigit() and 1 <= int(text) <= 200:  # Reasonable page limit for large inventories
+                # Check if URL looks like a pagination URL
+                if any(pattern in href.lower() for pattern in ['page=', 'p=', '/page/', '/p/', '?page', '&page']):
+                    full_url = urljoin(current_url, href)
+                    if full_url not in pagination_urls and full_url != current_url:
+                        pagination_urls.append(full_url)
+            
+            # Check for "next" or ">" links
+            if text.lower() in ['next', '>', '»', 'more', 'show more']:
+                full_url = urljoin(current_url, href)
+                if full_url not in pagination_urls and full_url != current_url:
+                    pagination_urls.append(full_url)
+        
+        # Extract URLs from pagination links found by selectors
+        for link in pagination_links:
+            href = link.get('href', '')
+            if href:
+                full_url = urljoin(current_url, href)
+                # Skip invalid URLs
+                if full_url.startswith(('http://', 'https://')):
+                    # Skip non-vehicle pages
+                    skip_patterns = ['/contact', '/about', '/financing', '/service']
+                    if not any(pattern in full_url.lower() for pattern in skip_patterns):
+                        if full_url not in pagination_urls and full_url != current_url:
+                            pagination_urls.append(full_url)
+        
+        # Also try to detect pagination from URL patterns (e.g., ?page=2, /page/2)
+        # Check if current URL has pagination parameters
+        parsed = urlparse(current_url)
+        if 'page' in parsed.query.lower() or '/page/' in parsed.path.lower():
+            # Try to find other pages by incrementing page number
+            base_url_without_page = current_url
+            # Remove page parameter
+            if '?' in base_url_without_page:
+                base_url_without_page = base_url_without_page.split('?')[0]
+            if '/page/' in base_url_without_page:
+                base_url_without_page = '/'.join(base_url_without_page.split('/page/')[:-1])
+            
+            # Try pages 2-10 (reasonable limit)
+            for page_num in range(2, 51):  # Try up to 50 pages for large inventories
+                # Try different pagination URL patterns
+                page_urls = [
+                    f"{base_url_without_page}?page={page_num}",
+                    f"{base_url_without_page}?p={page_num}",
+                    f"{base_url_without_page}/page/{page_num}",
+                    f"{base_url_without_page}/p/{page_num}",
+                ]
+                for page_url in page_urls:
+                    if page_url not in pagination_urls:
+                        pagination_urls.append(page_url)
+        
+        return pagination_urls
+    
+    def _follow_next_links(self, start_url: str, max_pages: int = 50) -> List[str]:
+        """
+        Follow "next" pagination links recursively to find all pages.
+        
+        Args:
+            start_url: Starting URL
+            max_pages: Maximum number of pages to follow
+        
+        Returns:
+            List of pagination URLs found
+        """
+        found_urls = []
+        current_url = start_url
+        visited = {start_url}
+        page_count = 0
+        
+        while page_count < max_pages:
             try:
-                html = self._get_page(pattern, check_robots=False)
-                # Check if this looks like an inventory page
-                if self._is_inventory_page(html):
-                    urls.append(pattern)
-                    logger.debug(f"{self.name}: Found inventory page at {pattern}")
-                    break
+                html = self._get_page(current_url, check_robots=False)
+                
+                # Look for "next" link
+                next_link = None
+                next_selectors = [
+                    'a[aria-label*="next" i]',
+                    'a[aria-label*="Next"]',
+                    'a.next',
+                    'a.Next',
+                    'a[rel="next"]',
+                    'a[class*="next" i]',
+                ]
+                
+                for selector in next_selectors:
+                    try:
+                        links = html.select(selector)
+                        if links:
+                            next_link = links[0]
+                            break
+                    except:
+                        continue
+                
+                # Also check text content for "next" or ">"
+                if not next_link:
+                    all_links = html.find_all('a', href=True)
+                    for link in all_links:
+                        text = link.get_text(strip=True).lower()
+                        if text in ['next', '>', '»', 'more', 'show more']:
+                            next_link = link
+                            break
+                
+                if next_link:
+                    href = next_link.get('href', '')
+                    if href:
+                        next_url = urljoin(current_url, href)
+                        # Skip invalid URLs
+                        if next_url.startswith(('http://', 'https://')):
+                            # Skip non-vehicle pages
+                            skip_patterns = ['/contact', '/about', '/financing', '/service']
+                            if not any(pattern in next_url.lower() for pattern in skip_patterns):
+                                if next_url not in visited:
+                                    found_urls.append(next_url)
+                                    visited.add(next_url)
+                                    current_url = next_url
+                                    page_count += 1
+                                    continue
+                
+                # No next link found, we're done
+                break
+                
             except Exception as e:
-                logger.debug(f"{self.name}: {pattern} not accessible: {e}")
-                continue
+                logger.debug(f"{self.name}: Error following next link from {current_url}: {e}")
+                break
         
-        # If no inventory page found, try the base URL
-        if not urls:
-            try:
-                html = self._get_page(base, check_robots=False)
-                if self._is_inventory_page(html):
-                    urls.append(base)
-            except:
-                pass
-        
-        # If still nothing, return the most likely URL
-        if not urls:
-            urls = [f"{base}/inventory"]
-            logger.warning(f"{self.name}: Using default inventory URL, may not work")
-        
-        return urls
+        return found_urls
     
     def _is_inventory_page(self, html: BeautifulSoup) -> bool:
         """Check if a page looks like an inventory/listing page."""
@@ -206,13 +416,23 @@ class GenericDealershipScraper(DealershipScraper):
             for link in all_links:
                 href = link.get('href', '')
                 text = link.get_text().lower()
+                
+                # Skip tel:, mailto:, and other invalid URL schemes
+                if href and not href.startswith(('http://', 'https://', '/', '#')):
+                    continue
+                
+                # Skip common non-vehicle pages
+                skip_patterns = ['/contact', '/about', '/financing', '/service', '/directions']
+                if any(pattern in href.lower() for pattern in skip_patterns):
+                    continue
+                
                 # Check if link looks like a vehicle detail page
                 if any(pattern in href.lower() for pattern in ['/vehicle/', '/inventory/', '/car/', '/detail/']):
                     if any(kw in text for kw in ['new', 'used', '2024', '2025']) or re.search(r'\d{4}', text):
                         vehicle_links.append(link)
             
             if vehicle_links:
-                vehicle_cards = vehicle_links[:50]  # Limit to reasonable number
+                vehicle_cards = vehicle_links  # Get all vehicle links, no limit
                 logger.debug(f"{self.name}: Found {len(vehicle_links)} potential vehicle links")
         
         # Extract summaries from cards
@@ -228,6 +448,17 @@ class GenericDealershipScraper(DealershipScraper):
                     continue
                 
                 detail_url = urljoin(self.base_url, href)
+                
+                # Skip tel:, mailto:, and other invalid URL schemes
+                if not detail_url.startswith(('http://', 'https://')):
+                    logger.debug(f"{self.name}: Skipping invalid URL scheme: {detail_url}")
+                    continue
+                
+                # Skip common non-vehicle pages
+                skip_patterns = ['/contact', '/about', '/financing', '/service', '/directions']
+                if any(pattern in detail_url.lower() for pattern in skip_patterns):
+                    logger.debug(f"{self.name}: Skipping non-vehicle page: {detail_url}")
+                    continue
                 
                 # Extract title
                 title = ""
@@ -498,10 +729,11 @@ class GenericDealershipScraper(DealershipScraper):
 class MultiDealershipScraper:
     """
     Scraper that handles multiple dealerships from CSV.
-    Creates a GenericDealershipScraper for each dealership.
+    Creates a GenericDealershipScraper (or SeleniumGenericDealershipScraper) for each dealership.
     """
     
-    def __init__(self, csv_path: str = "dealerships.csv", checkpoint_file: Optional[str] = ".scraper_checkpoint.json", resume: bool = True):
+    def __init__(self, csv_path: str = "dealerships.csv", checkpoint_file: Optional[str] = ".scraper_checkpoint.json", 
+                 resume: bool = True, use_selenium: bool = False, headless: bool = True):
         """
         Initialize multi-dealership scraper.
         
@@ -509,11 +741,15 @@ class MultiDealershipScraper:
             csv_path: Path to dealerships CSV file
             checkpoint_file: Path to checkpoint file for resuming
             resume: Whether to resume from checkpoint if available
+            use_selenium: Whether to use Selenium instead of requests
+            headless: Run Selenium in headless mode (only used if use_selenium=True)
         """
         self.csv_path = csv_path
         self.dealerships: List[DealershipInfo] = []
         self.checkpoint_file = checkpoint_file
         self.resume = resume
+        self.use_selenium = use_selenium
+        self.headless = headless
         self.checkpoint = CheckpointManager(checkpoint_file)
         self._load_dealerships()
         
@@ -562,14 +798,20 @@ class MultiDealershipScraper:
         # Scrape remaining dealerships
         for dealer_info in tqdm(remaining_dealerships, desc="Dealerships", disable=not TQDM_AVAILABLE):
             try:
-                scraper = GenericDealershipScraper(dealer_info)
+                # Use Selenium scraper if requested
+                if self.use_selenium:
+                    from .selenium_generic_scraper import SeleniumGenericDealershipScraper
+                    scraper = SeleniumGenericDealershipScraper(dealer_info, headless=self.headless)
+                else:
+                    scraper = GenericDealershipScraper(dealer_info)
                 listings = scraper.scrape()
                 all_listings.extend(listings)
                 completed_dealerships.add(dealer_info.name)
                 
                 # Stream output incrementally if writer provided
                 if output_writer and listings:
-                    output_writer.append_cars(listings)
+                    for listing in listings:
+                        output_writer.write_car(listing)
                     logger.debug(f"{dealer_info.name}: Streamed {len(listings)} vehicles to output")
                 
                 # Save checkpoint after each dealership

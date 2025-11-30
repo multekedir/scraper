@@ -137,6 +137,18 @@ Examples:
         help='Create a default configuration file at the specified path and exit'
     )
     
+    parser.add_argument(
+        '--use-selenium',
+        action='store_true',
+        help='Use Selenium WebDriver for JavaScript-heavy sites (slower but handles dynamic content)'
+    )
+    
+    parser.add_argument(
+        '--no-headless',
+        action='store_true',
+        help='Show browser window when using Selenium (default: headless mode)'
+    )
+    
     args = parser.parse_args()
     
     # Handle --create-config
@@ -308,11 +320,20 @@ Examples:
             )
             logger.info(f"Streaming output to {config.output_path} ({streaming_writer.format} format)")
             
+            # Determine if we should use Selenium
+            use_selenium = args.use_selenium
+            headless = not args.no_headless  # Default to headless unless --no-headless is specified
+            
+            if use_selenium:
+                logger.info(f"Using Selenium WebDriver (headless={headless})")
+            
             # Use MultiDealershipScraper to scrape all (with checkpoint support and streaming)
             multi_scraper = MultiDealershipScraper(
                 csv_path=str(csv_path),
                 checkpoint_file=".scraper_checkpoint.json",
-                resume=True
+                resume=True,
+                use_selenium=use_selenium,
+                headless=headless
             )
             all_cars = multi_scraper.scrape_all(output_writer=streaming_writer)
             

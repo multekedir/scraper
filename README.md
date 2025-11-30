@@ -49,6 +49,9 @@ python -m cars_scraper.cli --site dealer1 --site dealer2
 - `--format FORMAT`: Output format: `json`, `csv`, or `auto` (detect from extension). Default: `auto`
 - `--config PATH`: Path to configuration file (JSON). CLI arguments override config file settings
 - `--create-config PATH`: Create a default configuration file at the specified path and exit
+- `--use-selenium`: Use Selenium WebDriver for JavaScript-heavy sites (slower but handles dynamic content)
+- `--headless`: Run Selenium in headless mode (no browser window) - default when using Selenium
+- `--no-headless`: Show browser window when using Selenium (opposite of --headless)
 - `--max-price AMOUNT`: Maximum price threshold in dollars (default: 60000)
 - `--max-mileage MILES`: Maximum mileage for a car to be considered new (default: 100)
 - `--include-used`: Include used cars (default: only new cars)
@@ -76,6 +79,15 @@ python -m cars_scraper.cli --site dealer1 --site dealer2 --include-used
 Force CSV format regardless of file extension:
 ```bash
 python -m cars_scraper.cli --all-sites --output data.txt --format csv
+```
+
+Scrape using Selenium (for JavaScript-heavy sites):
+```bash
+# Run with browser visible (to see what's happening)
+python -m cars_scraper.cli --all-sites --use-selenium --no-headless
+
+# Run in headless mode (faster, no browser window)
+python -m cars_scraper.cli --all-sites --use-selenium
 ```
 
 ### Using Configuration Files

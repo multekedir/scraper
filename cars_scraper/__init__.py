@@ -16,6 +16,8 @@ from .validator import DataValidator, ValidationReport
 from .checkpoint import CheckpointManager
 from .utils import StreamingOutputWriter
 from .deduplicate import deduplicate_listings, deduplicate_by_vin_only, deduplicate_by_url_only
+from .selenium_driver import SeleniumDriver
+from .selenium_scraper import SeleniumDealershipScraper
 from .car_regexes import (
     first_group, VIN_REGEX, PRICE_REGEX, MILEAGE_REGEX, STOCK_REGEX,
     CONDITION_REGEX, AVAILABILITY_REGEX, normalize_drivetrain, parse_price_to_int,
@@ -52,6 +54,8 @@ __all__ = [
     "StreamingOutputWriter",
     "deduplicate_listings",
     "deduplicate_by_vin_only",
-    "deduplicate_by_url_only"
+    "deduplicate_by_url_only",
+    "SeleniumDriver",
+    "SeleniumDealershipScraper"
 ]
 
