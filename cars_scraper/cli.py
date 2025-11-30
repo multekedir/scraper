@@ -325,7 +325,11 @@ Examples:
             headless = not args.no_headless  # Default to headless unless --no-headless is specified
             
             if use_selenium:
-                logger.info(f"Using Selenium WebDriver (headless={headless})")
+                if headless:
+                    logger.info("Using Selenium WebDriver in HEADLESS mode (no browser window)")
+                else:
+                    logger.info("Using Selenium WebDriver with VISIBLE browser window")
+                    logger.info("You should see Chrome browser windows opening...")
             
             # Use MultiDealershipScraper to scrape all (with checkpoint support and streaming)
             multi_scraper = MultiDealershipScraper(

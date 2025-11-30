@@ -39,6 +39,9 @@ class SeleniumGenericDealershipScraper(SeleniumDealershipScraper):
             dealership_info: DealershipInfo object with name, website, and city
             headless: Run browser in headless mode
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Initializing Selenium scraper for {dealership_info.name} (headless={headless})")
         super().__init__(
             name=dealership_info.name,
             base_url=dealership_info.website,

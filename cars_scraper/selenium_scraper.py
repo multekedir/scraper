@@ -133,13 +133,15 @@ class SeleniumDealershipScraper(DealershipScraper):
         try:
             # Initialize driver once for entire scrape
             self._init_driver()
-            
+            logger.info(f"{self.name}: Selenium driver initialized (headless={self.headless})")
+            if not self.headless:
+                logger.info(f"{self.name}: Browser window should be visible - you should see Chrome open")
             # Call parent scrape method
             listings = super().scrape()
-            
             return listings
-            
         finally:
             # Always close driver when done
             self._close_driver()
+            if not self.headless:
+                logger.info(f"{self.name}: Browser window closed")
 

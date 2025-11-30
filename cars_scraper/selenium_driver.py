@@ -3,6 +3,7 @@ Selenium WebDriver configuration and utilities.
 """
 
 import logging
+import os
 from typing import Optional
 import random
 import time
@@ -57,13 +58,24 @@ class SeleniumDriver:
         if not SELENIUM_AVAILABLE:
             raise ImportError("Selenium is not installed. Install with: pip install selenium")
         
+        # Check if display is available when not in headless mode
+        if not self.headless:
+            display = os.environ.get('DISPLAY')
+            if not display:
+                logger.warning("DISPLAY environment variable not set. Chrome may not be able to open a visible window.")
+                logger.warning("If you're on Linux, you may need X11 forwarding or a display server.")
+                logger.warning("Consider using --headless mode or setting up X11 forwarding.")
+        
         if self.use_undetected:
-            logger.info("Using undetected_chromedriver for stealth")
+            logger.info(f"Using undetected_chromedriver for stealth (headless={self.headless})")
             options = uc.ChromeOptions()
             
             # Headless mode (careful - some sites detect headless)
             if self.headless:
                 options.add_argument('--headless=new')  # New headless mode
+                logger.debug("Chrome will run in headless mode")
+            else:
+                logger.info("Chrome will run with visible browser window")
             
             # Performance & stealth options
             options.add_argument('--disable-blink-features=AutomationControlled')
@@ -86,11 +98,14 @@ class SeleniumDriver:
             self.driver = uc.Chrome(options=options, version_main=120)
             
         else:
-            logger.info("Using standard Selenium ChromeDriver")
+            logger.info(f"Using standard Selenium ChromeDriver (headless={self.headless})")
             options = Options()
             
             if self.headless:
                 options.add_argument('--headless=new')
+                logger.debug("Chrome will run in headless mode")
+            else:
+                logger.info("Chrome will run with visible browser window")
             
             # Anti-detection options
             options.add_argument('--disable-blink-features=AutomationControlled')
@@ -107,7 +122,46 @@ class SeleniumDriver:
             
             # Create service
             if WEBDRIVER_MANAGER_AVAILABLE:
-                service = Service(ChromeDriverManager().install())
+                try:
+                    driver_path = ChromeDriverManager().install()
+                    # Fix: webdriver-manager sometimes returns wrong file (e.g., THIRD_PARTY_NOTICES)
+                    if 'THIRD_PARTY_NOTICES' in driver_path or not os.path.isfile(driver_path) or not os.access(driver_path, os.X_OK):
+                        # Find the actual chromedriver executable
+                        driver_dir = os.path.dirname(driver_path)
+                        chromedriver_found = False
+                        # Search in the directory structure
+                        for root, dirs, files in os.walk(driver_dir):
+                            for file in files:
+                                if file == 'chromedriver':
+                                    full_path = os.path.join(root, file)
+                                    if os.path.isfile(full_path) and os.access(full_path, os.X_OK):
+                                        driver_path = full_path
+                                        chromedriver_found = True
+                                        logger.debug(f"Found chromedriver at: {driver_path}")
+                                        break
+                            if chromedriver_found:
+                                break
+                        if not chromedriver_found:
+                            # Try parent directory
+                            parent_dir = os.path.dirname(driver_dir)
+                            for root, dirs, files in os.walk(parent_dir):
+                                for file in files:
+                                    if file == 'chromedriver':
+                                        full_path = os.path.join(root, file)
+                                        if os.path.isfile(full_path) and os.access(full_path, os.X_OK):
+                                            driver_path = full_path
+                                            chromedriver_found = True
+                                            logger.debug(f"Found chromedriver at: {driver_path}")
+                                            break
+                                if chromedriver_found:
+                                    break
+                        if not chromedriver_found:
+                            raise FileNotFoundError(f"Could not find chromedriver executable in {driver_dir}")
+                    service = Service(driver_path)
+                except Exception as e:
+                    logger.warning(f"Failed to use ChromeDriverManager: {e}. Trying system chromedriver.")
+                    # Fallback: use system ChromeDriver
+                    service = Service()
             else:
                 # Fallback: use system ChromeDriver
                 service = Service()
