@@ -10,10 +10,24 @@ from pathlib import Path
 from typing import List, Dict
 from .scraper import DealershipScraper
 from .filters import filter_cars
-from .utils import save_to_json, save_to_csv, save_to_file
+from .utils import save_to_json, save_to_csv, save_to_file, StreamingOutputWriter
+from .deduplicate import deduplicate_listings
 from .models import CarListing
 from .logging_config import setup_logging
 from .config import ScraperConfig
+from .validator import ValidationReport
+
+# Try to import tqdm for progress bars
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    # Create a dummy tqdm that just returns the iterable
+    def tqdm(iterable=None, *args, **kwargs):
+        if iterable is None:
+            return lambda x: x
+        return iterable
 
 # Import scrapers to register them
 try:
@@ -285,10 +299,28 @@ Examples:
         
         try:
             logger.info(f"Loading dealerships from {csv_path}")
-            # Use MultiDealershipScraper to scrape all
-            multi_scraper = MultiDealershipScraper(str(csv_path))
-            all_cars = multi_scraper.scrape_all()
+            
+            # Initialize streaming output writer
+            streaming_writer = StreamingOutputWriter(
+                output_path=config.output_path,
+                format=config.output_format if config.output_format != 'auto' else None,
+                append=False  # Start fresh, checkpoint handles resume
+            )
+            logger.info(f"Streaming output to {config.output_path} ({streaming_writer.format} format)")
+            
+            # Use MultiDealershipScraper to scrape all (with checkpoint support and streaming)
+            multi_scraper = MultiDealershipScraper(
+                csv_path=str(csv_path),
+                checkpoint_file=".scraper_checkpoint.json",
+                resume=True
+            )
+            all_cars = multi_scraper.scrape_all(output_writer=streaming_writer)
+            
+            # Finalize output file
+            streaming_writer.finalize()
+            
             logger.info(f"Generic scraper collected {len(all_cars)} total listings")
+            logger.info(f"Output saved to {config.output_path} ({streaming_writer.get_count()} listings)")
             sites_to_scrape = []  # Empty to skip the per-site loop
             
         except Exception as e:
@@ -312,9 +344,8 @@ Examples:
         print(f"Filters: {filter_summary}")
         print("-" * 60)
         
-        for idx, site_name in enumerate(sites_to_scrape, 1):
-            print(f"[{idx}/{len(sites_to_scrape)}] Scraping {site_name}...", end=' ', flush=True)
-            logger.info(f"[{idx}/{len(sites_to_scrape)}] Starting scrape: {site_name}")
+        for site_name in tqdm(sites_to_scrape, desc="Scraping sites", disable=not TQDM_AVAILABLE):
+            logger.info(f"Starting scrape: {site_name}")
             start_time = time.time()
             try:
                 scraper_class = SCRAPER_REGISTRY[site_name]
@@ -322,14 +353,12 @@ Examples:
                 cars = scraper.scrape()
                 all_cars.extend(cars)
                 elapsed = time.time() - start_time
-                print(f"Found {len(cars)} listings ({elapsed:.1f}s)")
                 logger.info(f"{site_name}: Found {len(cars)} listings in {elapsed:.2f} seconds")
                 if cars:
                     logger.debug(f"{site_name}: Sample vehicles: {[f'{c.year} {c.make} {c.model}' for c in cars[:3]]}")
             except Exception as e:
                 elapsed = time.time() - start_time
                 error_msg = f"Error scraping {site_name}: {str(e)}"
-                print(f"Error: {error_msg}", file=sys.stderr)
                 logger.error(f"{site_name}: Failed after {elapsed:.2f} seconds - {error_msg}", exc_info=True)
                 continue
         
@@ -345,6 +374,52 @@ Examples:
     if not all_cars:
         logger.warning("No vehicles found from any site")
         print("No cars found matching the criteria.")
+        sys.exit(0)
+    
+    # Validate all scraped listings
+    logger.info("Validating scraped data...")
+    from .validator import DataValidator
+    validation_report = ValidationReport()
+    validated_cars = []
+    
+    for car in all_cars:
+        is_valid, errors = DataValidator.validate_listing(car, strict=False)
+        validation_report.add_result(car, is_valid, errors)
+        if is_valid:
+            validated_cars.append(car)
+        else:
+            # Log invalid listings
+            error_msgs = [e for e in errors if not e.startswith("WARNING:")]
+            if error_msgs:
+                logger.debug(f"Invalid listing: {car.year} {car.make} {car.model} - {error_msgs[0]}")
+    
+    # Print validation report
+    validation_report.print_report()
+    
+    # Use validated cars for filtering
+    all_cars = validated_cars
+    
+    if not all_cars:
+        logger.warning("No valid vehicles found after validation")
+        print("No valid cars found after data validation.")
+        sys.exit(0)
+    
+    # Remove duplicates (by VIN or URL)
+    logger.info("Removing duplicate listings...")
+    all_cars, dedup_stats = deduplicate_listings(all_cars, prefer_latest=True)
+    
+    total_duplicates = dedup_stats['duplicates_by_vin'] + dedup_stats['duplicates_by_url']
+    if total_duplicates > 0:
+        logger.info(f"Deduplication: Removed {total_duplicates} duplicates "
+                   f"({dedup_stats['duplicates_by_vin']} by VIN, {dedup_stats['duplicates_by_url']} by URL)")
+        logger.info(f"After deduplication: {len(all_cars)}/{dedup_stats['total']} unique listings")
+        print(f"Removed {total_duplicates} duplicate listings ({dedup_stats['duplicates_by_vin']} by VIN, {dedup_stats['duplicates_by_url']} by URL)")
+    else:
+        logger.info("No duplicates found")
+    
+    if not all_cars:
+        logger.warning("No vehicles found after deduplication")
+        print("No unique cars found after deduplication.")
         sys.exit(0)
     
     # Log pre-filter statistics
@@ -409,14 +484,20 @@ Examples:
                 drivetrain_count[dt] = drivetrain_count.get(dt, 0) + 1
             logger.info(f"  - Drivetrains: {drivetrain_count}")
     
-    # Save to file (JSON or CSV)
-    if filtered_cars:
+    # Save to file (JSON or CSV) - only if not using streaming output
+    # Streaming output is already saved incrementally during scraping
+    if filtered_cars and not use_generic_scraper:
         logger.info(f"Saving {len(filtered_cars)} vehicles to {config.output_path}")
         output_format = config.output_format if config.output_format != 'auto' else None
         save_to_file(filtered_cars, config.output_path, format=output_format)
         output_type = 'CSV' if config.output_path.endswith('.csv') or output_format == 'csv' else 'JSON'
         print(f"Results saved to {config.output_path} ({output_type})")
         logger.info(f"Successfully saved {len(filtered_cars)} vehicles to {config.output_path} ({output_type})")
+    elif use_generic_scraper:
+        # Streaming output already handled, just log
+        logger.info(f"Results streamed to {config.output_path} during scraping")
+        output_format = config.output_format if config.output_format != 'auto' else 'auto'
+        print(f"Results streamed to {config.output_path} ({output_format} format)")
         
         # Print summary statistics
         if filtered_cars:

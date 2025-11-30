@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 from .models import CarListing
 from .robots import RobotsChecker
 from .field_keywords import FIELD_KEYWORDS, contains_keyword, get_keywords
+from .validator import DataValidator
 from .car_regexes import (
     first_group, VIN_REGEX, PRICE_REGEX, MILEAGE_REGEX, STOCK_REGEX,
     CONDITION_REGEX, AVAILABILITY_REGEX, BODY_STYLE_LABEL_REGEX, BODY_STYLE_VALUE_REGEX,
@@ -30,6 +31,18 @@ try:
     CACHING_AVAILABLE = True
 except ImportError:
     CACHING_AVAILABLE = False
+
+# Try to import tqdm for progress bars
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    # Create a dummy tqdm that just returns the iterable
+    def tqdm(iterable=None, *args, **kwargs):
+        if iterable is None:
+            return lambda x: x
+        return iterable
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +80,7 @@ class DealershipScraper(ABC):
         # Set up robots.txt checker
         self.robots_checker: Optional[RobotsChecker] = None
         if check_robots:
-            user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             self.robots_checker = RobotsChecker(base_url, user_agent)
             self.robots_checker.check()
             disallowed = self.robots_checker.get_disallowed_paths()
@@ -87,7 +100,12 @@ class DealershipScraper(ABC):
             self.session = requests.Session()
         
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
         })
     
     def _rate_limit(self):
@@ -128,14 +146,34 @@ class DealershipScraper(ABC):
         
         self._rate_limit()
         
-        try:
-            # If using cache, requests_cache will automatically return cached responses
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return BeautifulSoup(response.content, 'lxml')
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch {url}: {e}")
-            raise requests.RequestException(f"Failed to fetch {url}: {str(e)}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # If using cache, requests_cache will automatically return cached responses
+                response = self.session.get(url, params=params, timeout=10)
+                
+                # Handle 403 with exponential backoff
+                if response.status_code == 403:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5 + random.uniform(2, 5)
+                        logger.warning(f"403 on {url}, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise requests.RequestException(f"403 after {max_retries} attempts")
+                
+                response.raise_for_status()
+                return BeautifulSoup(response.content, 'lxml')
+            except requests.RequestException as e:
+                if attempt < max_retries - 1:
+                    # For other errors, also retry with backoff
+                    wait_time = (attempt + 1) * 2 + random.uniform(1, 3)
+                    logger.warning(f"Request error on {url}: {e}, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Failed to fetch {url} after {max_retries} attempts: {e}")
+                    raise requests.RequestException(f"Failed to fetch {url}: {str(e)}")
     
     def clear_cache(self):
         """Clear the cache for this scraper."""
@@ -232,23 +270,35 @@ class DealershipScraper(ABC):
             listing_urls = self.get_listing_urls()
             logger.info(f"{self.name}: Found {len(listing_urls)} listing page(s)")
             
-            for listing_url in listing_urls:
+            # Collect all summaries first
+            all_summaries = []
+            for listing_url in tqdm(listing_urls, desc=f"{self.name}: Listing pages", disable=not TQDM_AVAILABLE, leave=False):
                 try:
                     html = self._get_page(listing_url)
                     summaries = self.parse_list_page(html, listing_url)
                     logger.info(f"{self.name}: Found {len(summaries)} vehicles on {listing_url}")
-                    
-                    for summary in summaries:
-                        try:
-                            detail_html = self._get_page(summary.detail_url)
-                            listing = self.parse_detail_page(detail_html, summary.detail_url)
-                            if listing:
-                                all_listings.append(listing)
-                        except Exception as e:
-                            logger.warning(f"{self.name}: Failed to parse detail page {summary.detail_url}: {e}")
-                            continue
+                    all_summaries.extend(summaries)
                 except Exception as e:
                     logger.error(f"{self.name}: Failed to process listing page {listing_url}: {e}")
+                    continue
+            
+            # Process detail pages with progress bar
+            for summary in tqdm(all_summaries, desc=f"{self.name}: Detail pages", disable=not TQDM_AVAILABLE, leave=False):
+                try:
+                    detail_html = self._get_page(summary.detail_url)
+                    listing = self.parse_detail_page(detail_html, summary.detail_url)
+                    if listing:
+                        # Validate listing before adding
+                        is_valid, errors = DataValidator.validate_listing(listing, strict=False)
+                        if is_valid:
+                            all_listings.append(listing)
+                        else:
+                            logger.warning(f"{self.name}: Invalid listing skipped: {listing.year} {listing.make} {listing.model}")
+                            for error in errors:
+                                if not error.startswith("WARNING:"):
+                                    logger.debug(f"  - {error}")
+                except Exception as e:
+                    logger.warning(f"{self.name}: Failed to parse detail page {summary.detail_url}: {e}")
                     continue
             
             logger.info(f"{self.name}: Successfully scraped {len(all_listings)} vehicles")

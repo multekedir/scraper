@@ -12,6 +12,7 @@ from ..models import CarListing
 from ..cli import register_scraper
 from ..dealership_loader import load_dealerships_from_csv, DealershipInfo
 from ..field_keywords import FIELD_KEYWORDS, get_keywords, contains_keyword
+from ..checkpoint import CheckpointManager
 from ..car_regexes import (
     first_group, VIN_REGEX, PRICE_REGEX, MILEAGE_REGEX, STOCK_REGEX,
     CONDITION_REGEX, AVAILABILITY_REGEX, BODY_STYLE_LABEL_REGEX, BODY_STYLE_VALUE_REGEX,
@@ -21,6 +22,18 @@ from ..car_regexes import (
 )
 from datetime import datetime
 import logging
+
+# Try to import tqdm for progress bars
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    # Create a dummy tqdm that just returns the iterable
+    def tqdm(iterable=None, *args, **kwargs):
+        if iterable is None:
+            return lambda x: x
+        return iterable
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +54,10 @@ class GenericDealershipScraper(DealershipScraper):
         super().__init__(
             name=dealership_info.name,
             base_url=dealership_info.website,
-            min_delay=1.0,
-            max_delay=2.0,
+            min_delay=3.0,  # Slower = less bot-like
+            max_delay=7.0,  # Random delays 3-7 seconds
             use_cache=True,
-            check_robots=True
+            check_robots=False  # Site blocks robots.txt too
         )
         self.dealership_info = dealership_info
         self.city = dealership_info.city
@@ -488,16 +501,27 @@ class MultiDealershipScraper:
     Creates a GenericDealershipScraper for each dealership.
     """
     
-    def __init__(self, csv_path: str = "dealerships.csv"):
+    def __init__(self, csv_path: str = "dealerships.csv", checkpoint_file: Optional[str] = ".scraper_checkpoint.json", resume: bool = True):
         """
         Initialize multi-dealership scraper.
         
         Args:
             csv_path: Path to dealerships CSV file
+            checkpoint_file: Path to checkpoint file for resuming
+            resume: Whether to resume from checkpoint if available
         """
         self.csv_path = csv_path
         self.dealerships: List[DealershipInfo] = []
+        self.checkpoint_file = checkpoint_file
+        self.resume = resume
+        self.checkpoint = CheckpointManager(checkpoint_file)
         self._load_dealerships()
+        
+        # Load checkpoint if resuming
+        if self.resume:
+            checkpoint_loaded = self.checkpoint.load()
+            if checkpoint_loaded:
+                logger.info(f"Resuming from checkpoint: {len(self.checkpoint.completed_dealerships)} dealerships already completed")
     
     def _load_dealerships(self):
         """Load dealerships from CSV."""
@@ -508,24 +532,61 @@ class MultiDealershipScraper:
             logger.error(f"Failed to load dealerships from {self.csv_path}: {e}")
             self.dealerships = []
     
-    def scrape_all(self) -> List[CarListing]:
+    def scrape_all(self, output_writer=None) -> List[CarListing]:
         """
-        Scrape all dealerships.
+        Scrape all dealerships with checkpoint support and optional streaming output.
+        
+        Args:
+            output_writer: Optional StreamingOutputWriter for incremental saves
         
         Returns:
             List of all CarListing objects from all dealerships
         """
-        all_listings = []
+        # Start with listings from checkpoint
+        all_listings = self.checkpoint.get_listings()
+        completed_dealerships = set(self.checkpoint.completed_dealerships)
         
-        for dealer_info in self.dealerships:
+        # Filter out already completed dealerships
+        remaining_dealerships = [
+            dealer for dealer in self.dealerships 
+            if dealer.name not in completed_dealerships
+        ]
+        
+        if not remaining_dealerships:
+            logger.info("All dealerships already completed (from checkpoint)")
+            return all_listings
+        
+        logger.info(f"Scraping {len(remaining_dealerships)} remaining dealerships "
+                   f"(skipping {len(completed_dealerships)} already completed)")
+        
+        # Scrape remaining dealerships
+        for dealer_info in tqdm(remaining_dealerships, desc="Dealerships", disable=not TQDM_AVAILABLE):
             try:
                 scraper = GenericDealershipScraper(dealer_info)
                 listings = scraper.scrape()
                 all_listings.extend(listings)
-                logger.info(f"{dealer_info.name}: Scraped {len(listings)} vehicles")
+                completed_dealerships.add(dealer_info.name)
+                
+                # Stream output incrementally if writer provided
+                if output_writer and listings:
+                    output_writer.append_cars(listings)
+                    logger.debug(f"{dealer_info.name}: Streamed {len(listings)} vehicles to output")
+                
+                # Save checkpoint after each dealership
+                self.checkpoint.save(completed_dealerships, all_listings)
+                
+                logger.info(f"{dealer_info.name}: Scraped {len(listings)} vehicles "
+                          f"(total: {len(all_listings)} listings)")
             except Exception as e:
                 logger.error(f"{dealer_info.name}: Scraping failed: {e}", exc_info=True)
+                # Still save checkpoint even on failure, so we don't retry failed ones
+                completed_dealerships.add(dealer_info.name)
+                self.checkpoint.save(completed_dealerships, all_listings)
                 continue
+        
+        # Final checkpoint save
+        self.checkpoint.save(completed_dealerships, all_listings)
+        logger.info(f"Scraping complete: {len(all_listings)} total listings from {len(completed_dealerships)} dealerships")
         
         return all_listings
 

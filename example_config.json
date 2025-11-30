@@ -21,9 +21,8 @@
   "exclude_status": ["sold"],
   "output_path": "cars.csv",
   "output_format": "auto",
-  "sites": null,
-  "all_sites": true,
-  "log_level": "INFO",
+  "sites": ["beaverton_kia"],
+  "log_level": "DEBUG",
   "log_file": null
 }
 

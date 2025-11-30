@@ -39,6 +39,7 @@ ENV/
 *.json
 !example_config.json
 !scraper_config.json
+.scraper_checkpoint.json
 *.db
 *.sqlite
 *.sqlite3

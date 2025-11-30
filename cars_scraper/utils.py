@@ -249,3 +249,165 @@ def save_to_file(cars: List[CarListing], output_path: str, format: Optional[str]
     else:
         save_to_json(cars, output_path, pretty=True)
 
+
+class StreamingOutputWriter:
+    """
+    Streams output incrementally to prevent data loss and memory issues.
+    Saves results after each batch instead of waiting until the end.
+    """
+    
+    def __init__(self, output_path: str, format: Optional[str] = None, append: bool = False):
+        """
+        Initialize streaming output writer.
+        
+        Args:
+            output_path: Path to output file
+            format: Output format ('json', 'csv', 'jsonl', or None for auto-detect)
+            append: Whether to append to existing file (default: False)
+        """
+        self.output_path = Path(output_path)
+        self.append = append
+        
+        # Auto-detect format if not specified
+        if format is None:
+            ext = self.output_path.suffix.lower()
+            if ext == '.csv':
+                self.format = 'csv'
+            elif ext == '.jsonl':
+                self.format = 'jsonl'
+            elif ext == '.json':
+                self.format = 'json'
+            else:
+                self.format = 'json'
+        else:
+            self.format = format.lower()
+        
+        # Initialize file based on format
+        self._initialize_file()
+    
+    def _initialize_file(self):
+        """Initialize output file with headers/metadata."""
+        if self.append and self.output_path.exists():
+            # File exists, don't overwrite headers
+            return
+        
+        if self.format == 'csv':
+            # Write CSV header
+            with open(self.output_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=_get_csv_fieldnames())
+                writer.writeheader()
+        elif self.format == 'json':
+            # Write JSON array start
+            with open(self.output_path, 'w', encoding='utf-8') as f:
+                f.write('{\n')
+                f.write('  "metadata": {\n')
+                f.write(f'    "timestamp": "{datetime.now().isoformat()}",\n')
+                f.write('    "source": "electric-car-scraper-cli",\n')
+                f.write('    "streaming": true\n')
+                f.write('  },\n')
+                f.write('  "cars": [\n')
+        elif self.format == 'jsonl':
+            # JSONL doesn't need initialization, just append lines
+            pass
+    
+    def append_cars(self, cars: List[CarListing]):
+        """
+        Append cars to output file incrementally.
+        
+        Args:
+            cars: List of CarListing objects to append
+        """
+        if not cars:
+            return
+        
+        if self.format == 'csv':
+            # Append rows to CSV
+            with open(self.output_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=_get_csv_fieldnames())
+                for car in cars:
+                    writer.writerow(_car_to_csv_row(car))
+        
+        elif self.format == 'jsonl':
+            # Append JSON lines (one JSON object per line)
+            with open(self.output_path, 'a', encoding='utf-8') as f:
+                for car in cars:
+                    json.dump(car.to_dict(), f, ensure_ascii=False)
+                    f.write('\n')
+        
+        elif self.format == 'json':
+            # Append to JSON array
+            with open(self.output_path, 'r+', encoding='utf-8') as f:
+                # Read existing content
+                content = f.read()
+                
+                # Check if we need to add comma (if array is not empty)
+                needs_comma = not content.rstrip().endswith('[\n')
+                
+                # Remove closing brackets/braces
+                content = content.rstrip()
+                if content.endswith('\n  ]\n}'):
+                    content = content[:-7]  # Remove '\n  ]\n}'
+                elif content.endswith(']'):
+                    content = content[:-1]  # Remove ']'
+                
+                # Write back without closing
+                f.seek(0)
+                f.truncate()
+                f.write(content)
+                
+                # Add comma if needed
+                if needs_comma:
+                    f.write(',\n')
+                
+                # Append new cars
+                for i, car in enumerate(cars):
+                    if i > 0:
+                        f.write(',\n')
+                    car_json = json.dumps(car.to_dict(), indent=4, ensure_ascii=False)
+                    # Indent each line
+                    for line in car_json.split('\n'):
+                        f.write('    ' + line + '\n')
+                
+                # Close array and object
+                f.write('  ]\n}')
+    
+    def finalize(self):
+        """Finalize output file (close JSON arrays, etc.)."""
+        if self.format == 'json':
+            # Ensure JSON is properly closed
+            with open(self.output_path, 'r+', encoding='utf-8') as f:
+                content = f.read()
+                if not content.rstrip().endswith('}'):
+                    # Add closing if missing
+                    f.seek(0, 2)  # Go to end
+                    if not content.rstrip().endswith(']'):
+                        f.write('\n  ]\n}')
+                    else:
+                        f.write('\n}')
+    
+    def get_count(self) -> int:
+        """
+        Get current count of saved listings.
+        
+        Returns:
+            Number of listings in output file
+        """
+        if not self.output_path.exists():
+            return 0
+        
+        try:
+            if self.format == 'csv':
+                with open(self.output_path, 'r', encoding='utf-8') as f:
+                    return sum(1 for _ in f) - 1  # Subtract header
+            elif self.format == 'jsonl':
+                with open(self.output_path, 'r', encoding='utf-8') as f:
+                    return sum(1 for _ in f)
+            elif self.format == 'json':
+                with open(self.output_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return len(data.get('cars', []))
+        except Exception:
+            return 0
+        
+        return 0
+

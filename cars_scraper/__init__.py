@@ -12,6 +12,10 @@ from .robots import RobotsChecker
 from .logging_config import setup_logging
 from .config import ScraperConfig
 from .field_keywords import FIELD_KEYWORDS, get_keywords, contains_keyword
+from .validator import DataValidator, ValidationReport
+from .checkpoint import CheckpointManager
+from .utils import StreamingOutputWriter
+from .deduplicate import deduplicate_listings, deduplicate_by_vin_only, deduplicate_by_url_only
 from .car_regexes import (
     first_group, VIN_REGEX, PRICE_REGEX, MILEAGE_REGEX, STOCK_REGEX,
     CONDITION_REGEX, AVAILABILITY_REGEX, normalize_drivetrain, parse_price_to_int,
@@ -41,6 +45,13 @@ __all__ = [
     "STOCK_REGEX",
     "normalize_drivetrain",
     "parse_price_to_int",
-    "regex_is_electric"
+    "regex_is_electric",
+    "DataValidator",
+    "ValidationReport",
+    "CheckpointManager",
+    "StreamingOutputWriter",
+    "deduplicate_listings",
+    "deduplicate_by_vin_only",
+    "deduplicate_by_url_only"
 ]
 
